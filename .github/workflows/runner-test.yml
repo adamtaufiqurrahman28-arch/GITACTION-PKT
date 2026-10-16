@@ -1,0 +1,22 @@
+
+name: ADM-GITACTION Runner Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runner-test:
+    runs-on: [self-hosted, Linux, X64, adm-gitaction, pkt]
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify Ubuntu Runner
+        run: |
+          echo "GitHub Actions Connected Successfully"
+          hostname
+          whoami
+          uname -m
+          date
