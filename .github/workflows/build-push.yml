@@ -1,0 +1,49 @@
+﻿name: Seraphim Docker Build and Push
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-build-push:
+    runs-on: [self-hosted, Linux, X64, adm-gitaction, pkt]
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+
+      - name: Verify Docker
+        run: |
+          docker --version
+          docker buildx version
+
+      - name: Build and Push to Harbor
+        shell: bash
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          export DOCKER_CONFIG="$(mktemp -d)"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+
+          IMAGE="$HARBOR_REGISTRY/seraphim-secure-pipeline/nginx-lab"
+          TAG="sha-${GITHUB_SHA::12}"
+
+          printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" \
+            -u "$HARBOR_USERNAME" --password-stdin
+
+          docker build -t "$IMAGE:latest" -t "$IMAGE:$TAG" .
+
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:$TAG"
+
+          echo "Build and Push Successful"
