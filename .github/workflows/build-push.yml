@@ -1,4 +1,5 @@
-﻿name: Seraphim Docker Build and Push
+﻿
+name: Seraphim Secure Pipeline - Build and Push
 
 on:
   push:
@@ -11,19 +12,31 @@ permissions:
 
 jobs:
   docker-build-push:
-    runs-on: [self-hosted, Linux, X64, adm-gitaction, pkt]
+    name: Docker Build and Harbor Push
+
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - adm-gitaction
+      - pkt
+
     timeout-minutes: 20
 
     steps:
-      - name: Checkout Source
+      # STEP 1 - Checkout repository
+      - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      - name: Verify Docker
+      # STEP 2 - Verify Docker environment
+      - name: Verify Docker and Buildx
         run: |
           docker --version
           docker buildx version
+          docker info --format 'Storage: {{.Driver}}'
 
-      - name: Build and Push to Harbor
+      # STEP 3 - Authenticate and push image
+      - name: Build and Push Image to Harbor
         shell: bash
         env:
           HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
@@ -32,18 +45,52 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Temporary Docker credentials
           export DOCKER_CONFIG="$(mktemp -d)"
           trap 'rm -rf "$DOCKER_CONFIG"' EXIT
 
-          IMAGE="$HARBOR_REGISTRY/seraphim-secure-pipeline/nginx-lab"
+          # Image configuration
+          IMAGE="${HARBOR_REGISTRY}/seraphim-secure-pipeline/nginx-lab"
           TAG="sha-${GITHUB_SHA::12}"
 
-          printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" \
-            -u "$HARBOR_USERNAME" --password-stdin
+          echo "================================="
+          echo "SERAPHIM SECURE PIPELINE"
+          echo "================================="
 
-          docker build -t "$IMAGE:latest" -t "$IMAGE:$TAG" .
+          # Authenticate to Harbor
+          echo "Authenticating to Harbor..."
 
-          docker push "$IMAGE:latest"
-          docker push "$IMAGE:$TAG"
+          printf '%s' "$HARBOR_PASSWORD" | \
+            docker login "$HARBOR_REGISTRY" \
+            --username "$HARBOR_USERNAME" \
+            --password-stdin
 
-          echo "Build and Push Successful"
+          # Buildx verification
+          echo "Checking Buildx builder..."
+          docker buildx inspect --bootstrap
+
+          # Build and push directly
+          echo "Building and pushing image..."
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --progress=plain \
+            --tag "${IMAGE}:latest" \
+            --tag "${IMAGE}:${TAG}" \
+            --push \
+            .
+
+          echo "================================="
+          echo "DOCKER BUILD AND PUSH SUCCESSFUL"
+          echo "================================="
+
+          docker logout "$HARBOR_REGISTRY"
+
+      # STEP 4 - Pipeline summary
+      - name: Pipeline Summary
+        if: success()
+        run: |
+          echo "### Seraphim Secure Pipeline" >> "$GITHUB_STEP_SUMMARY"
+          echo "Docker Build: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
+          echo "Harbor Push: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
