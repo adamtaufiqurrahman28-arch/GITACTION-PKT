@@ -1,0 +1,39 @@
+
+name: Harbor Registry Login Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  harbor-login:
+    runs-on: [self-hosted, Linux, X64, adm-gitaction, pkt]
+    timeout-minutes: 5
+
+    steps:
+      - name: Verify Docker
+        run: |
+          docker --version
+          docker info --format '{{.ServerVersion}}'
+
+      - name: Login to Harbor Registry
+        shell: bash
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          export DOCKER_CONFIG="$(mktemp -d)"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+
+          printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" \
+            --username "$HARBOR_USERNAME" \
+            --password-stdin
+
+          echo "Harbor Authentication Successful"
+
+          docker logout "$HARBOR_REGISTRY"
