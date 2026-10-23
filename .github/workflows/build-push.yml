@@ -1,5 +1,5 @@
-﻿
-name: Seraphim Secure Pipeline - Build and Push
+
+name: Seraphim Secure Pipeline - Build, Push and Security Gate
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   docker-build-push:
-    name: Docker Build and Harbor Push
+    name: Docker Build - Harbor - CrowdStrike FCS
 
     runs-on:
       - self-hosted
@@ -21,21 +21,21 @@ jobs:
       - adm-gitaction
       - pkt
 
-    timeout-minutes: 20
+    timeout-minutes: 40
 
     steps:
-      # STEP 1 - Checkout repository
+      # STEP 1 - Checkout
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      # STEP 2 - Verify Docker environment
+      # STEP 2 - Verify Docker
       - name: Verify Docker and Buildx
         run: |
           docker --version
           docker buildx version
           docker info --format 'Storage: {{.Driver}}'
 
-      # STEP 3 - Authenticate and push image
+      # STEP 3 - Build and push image to Harbor
       - name: Build and Push Image to Harbor
         shell: bash
         env:
@@ -45,32 +45,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Temporary Docker credentials
           export DOCKER_CONFIG="$(mktemp -d)"
           trap 'rm -rf "$DOCKER_CONFIG"' EXIT
 
-          # Image configuration
           IMAGE="${HARBOR_REGISTRY}/seraphim-secure-pipeline/nginx-lab"
           TAG="sha-${GITHUB_SHA::12}"
 
-          echo "================================="
-          echo "SERAPHIM SECURE PIPELINE"
-          echo "================================="
-
-          # Authenticate to Harbor
-          echo "Authenticating to Harbor..."
+          echo "========================================"
+          echo " STEP 3 - BUILD AND PUSH TO HARBOR"
+          echo "========================================"
 
           printf '%s' "$HARBOR_PASSWORD" | \
             docker login "$HARBOR_REGISTRY" \
-            --username "$HARBOR_USERNAME" \
-            --password-stdin
+              --username "$HARBOR_USERNAME" \
+              --password-stdin
 
-          # Buildx verification
-          echo "Checking Buildx builder..."
           docker buildx inspect --bootstrap
-
-          # Build and push directly
-          echo "Building and pushing image..."
 
           docker buildx build \
             --platform linux/amd64 \
@@ -80,17 +70,97 @@ jobs:
             --push \
             .
 
-          echo "================================="
-          echo "DOCKER BUILD AND PUSH SUCCESSFUL"
-          echo "================================="
+          echo "BUILD AND PUSH SUCCESSFUL"
 
-          docker logout "$HARBOR_REGISTRY"
+      # STEP 4 - Pull the exact commit-tagged image
+      - name: Prepare Image for CrowdStrike FCS
+        id: prepare_image
+        shell: bash
+        env:
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
 
-      # STEP 4 - Pipeline summary
+          export DOCKER_CONFIG="$(mktemp -d)"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+
+          IMAGE="${HARBOR_REGISTRY}/seraphim-secure-pipeline/nginx-lab:sha-${GITHUB_SHA::12}"
+
+          echo "========================================"
+          echo " STEP 4 - PREPARE IMAGE FOR FCS"
+          echo "========================================"
+
+          printf '%s' "$HARBOR_PASSWORD" | \
+            docker login "$HARBOR_REGISTRY" \
+              --username "$HARBOR_USERNAME" \
+              --password-stdin
+
+          echo "[1/2] Pull image from Harbor"
+          docker pull "$IMAGE"
+
+          echo "[2/2] Verify local image"
+          docker image inspect "$IMAGE" \
+            --format 'Image ID: {{.Id}}'
+
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+          echo "IMAGE READY FOR FCS"
+
+      # STEP 5 - CrowdStrike image scanning
+      - name: CrowdStrike FCS Image Scan
+        id: fcs
+        uses: crowdstrike/fcs-action@v5.0.4
+        with:
+          falcon_client_id: ${{ vars.FALCON_CLIENT_ID }}
+          falcon_region: us-1
+          scan_type: image
+          image: docker://${{ steps.prepare_image.outputs.image }}
+          socket: unix:///var/run/docker.sock
+          platform: linux/amd64
+          upload_results: true
+          report_formats: json
+          output_path: ./image-scan-results.json
+          timeout: 600
+        env:
+          FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
+
+      # STEP 6 - Enforce security gate (fail closed)
+      - name: Enforce CrowdStrike Security Gate
+        if: ${{ always() && steps.prepare_image.outcome == 'success' }}
+        shell: bash
+        env:
+          FCS_OUTCOME: ${{ steps.fcs.outcome }}
+          FCS_EXIT_CODE: ${{ steps.fcs.outputs.exit-code }}
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo " STEP 6 - CROWDSTRIKE SECURITY GATE"
+          echo "========================================"
+
+          echo "FCS Action: $FCS_OUTCOME"
+          echo "FCS Exit Code: ${FCS_EXIT_CODE:-missing}"
+
+          if [[ "$FCS_OUTCOME" != "success" || "$FCS_EXIT_CODE" != "0" ]]; then
+            echo "::error::SECURITY GATE FAILED"
+            echo "DEPLOYMENT BLOCKED"
+            exit 1
+          fi
+
+          echo "SECURITY GATE: PASS"
+          echo "IMAGE APPROVED FOR NEXT PIPELINE STAGE"
+
+      # STEP 7 - Pipeline summary
       - name: Pipeline Summary
         if: success()
+        shell: bash
         run: |
           echo "### Seraphim Secure Pipeline" >> "$GITHUB_STEP_SUMMARY"
-          echo "Docker Build: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
-          echo "Harbor Push: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
-          echo "Commit: ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Docker Build: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Harbor Push: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
+          echo "- CrowdStrike FCS Scan: PASS" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Security Gate: APPROVED" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Commit: ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
