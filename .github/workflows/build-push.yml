@@ -1,5 +1,5 @@
 
-name: Seraphim Secure Pipeline - Build, Push and Security Gate
+name: Seraphim Secure Pipeline - Build, Scan and Deploy
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   docker-build-push:
-    name: Docker Build - Harbor - CrowdStrike FCS
+    name: Docker Build - Harbor - FCS - Docker Swarm
 
     runs-on:
       - self-hosted
@@ -35,7 +35,7 @@ jobs:
           docker buildx version
           docker info --format 'Storage: {{.Driver}}'
 
-      # STEP 3 - Build and push image to Harbor
+      # STEP 3 - Build and push to Harbor
       - name: Build and Push Image to Harbor
         shell: bash
         env:
@@ -45,6 +45,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          umask 077
           export DOCKER_CONFIG="$(mktemp -d)"
           trap 'rm -rf "$DOCKER_CONFIG"' EXIT
 
@@ -72,7 +73,7 @@ jobs:
 
           echo "BUILD AND PUSH SUCCESSFUL"
 
-      # STEP 4 - Pull the exact commit-tagged image
+      # STEP 4 - Pull exact image from Harbor
       - name: Prepare Image for CrowdStrike FCS
         id: prepare_image
         shell: bash
@@ -83,6 +84,7 @@ jobs:
         run: |
           set -euo pipefail
 
+          umask 077
           export DOCKER_CONFIG="$(mktemp -d)"
           trap 'rm -rf "$DOCKER_CONFIG"' EXIT
 
@@ -97,10 +99,8 @@ jobs:
               --username "$HARBOR_USERNAME" \
               --password-stdin
 
-          echo "[1/2] Pull image from Harbor"
           docker pull "$IMAGE"
 
-          echo "[2/2] Verify local image"
           docker image inspect "$IMAGE" \
             --format 'Image ID: {{.Id}}'
 
@@ -108,7 +108,7 @@ jobs:
 
           echo "IMAGE READY FOR FCS"
 
-      # STEP 5 - CrowdStrike image scanning
+      # STEP 5 - CrowdStrike FCS Image Scan
       - name: CrowdStrike FCS Image Scan
         id: fcs
         uses: crowdstrike/fcs-action@v5.0.4
@@ -126,8 +126,9 @@ jobs:
         env:
           FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
 
-      # STEP 6 - Enforce security gate (fail closed)
+      # STEP 6 - CrowdStrike Security Gate
       - name: Enforce CrowdStrike Security Gate
+        id: security_gate
         if: ${{ always() && steps.prepare_image.outcome == 'success' }}
         shell: bash
         env:
@@ -152,10 +153,120 @@ jobs:
           echo "SECURITY GATE: PASS"
           echo "IMAGE APPROVED FOR NEXT PIPELINE STAGE"
 
-      # STEP 7 - Pipeline summary
+      # STEP 7 - Docker Swarm Deployment
+      - name: Deploy Approved Image to Docker Swarm
+        id: swarm_deploy
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.security_gate.outcome == 'success' && steps.fcs.outputs.exit-code == '0' }}
+        shell: bash
+        env:
+          ENABLE_DEPLOY: ${{ vars.ENABLE_SWARM_DEPLOY }}
+          HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
+          TAGGED_IMAGE: ${{ steps.prepare_image.outputs.image }}
+          SWARM_HARBOR_USERNAME: ${{ secrets.SWARM_HARBOR_USERNAME }}
+          SWARM_HARBOR_PASSWORD: ${{ secrets.SWARM_HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          echo "========================================"
+          echo " STEP 7 - DOCKER SWARM DEPLOYMENT"
+          echo "========================================"
+
+          SERVICE="seraphim-nginx-lab"
+          REPO="${HARBOR_REGISTRY}/seraphim-secure-pipeline/nginx-lab"
+
+          echo ""
+          echo "[1/5] VERIFY APPROVED IMAGE DIGEST"
+
+          DEPLOY_IMAGE=""
+
+          while IFS= read -r REF; do
+            if [[ "$REF" == "${REPO}@sha256:"* ]]; then
+              DEPLOY_IMAGE="$REF"
+              break
+            fi
+          done < <(
+            docker image inspect "$TAGGED_IMAGE" \
+              --format '{{range .RepoDigests}}{{println .}}{{end}}'
+          )
+
+          if [[ -z "$DEPLOY_IMAGE" ]]; then
+            echo "::error::Registry image digest not found"
+            exit 1
+          fi
+
+          echo "Approved image: $DEPLOY_IMAGE"
+
+          echo ""
+          echo "[2/5] VERIFY REMOTE SWARM MANAGER"
+
+          test "$(docker --host ssh://seraphim-swarm \
+            info --format '{{.Swarm.ControlAvailable}}')" = "true"
+
+          docker --host ssh://seraphim-swarm \
+            service inspect "$SERVICE" >/dev/null
+
+          echo "SWARM CONNECTION: SUCCESS"
+
+          echo ""
+          echo "[3/5] CHECK DEPLOYMENT MODE"
+
+          if [[ "$ENABLE_DEPLOY" != "true" ]]; then
+            echo "DEPLOYMENT MODE: DRY RUN"
+            echo "SECURITY GATE: PASS"
+            echo "Approved image: $DEPLOY_IMAGE"
+            echo "NO SWARM SERVICE CHANGES"
+            exit 0
+          fi
+
+          echo ""
+          echo "[4/5] AUTHENTICATE TO HARBOR"
+
+          umask 077
+          export DOCKER_CONFIG="$(mktemp -d)"
+          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+
+          printf '%s' "$SWARM_HARBOR_PASSWORD" | \
+            docker login "$HARBOR_REGISTRY" \
+              --username "$SWARM_HARBOR_USERNAME" \
+              --password-stdin
+
+          echo ""
+          echo "[5/5] DEPLOY APPROVED IMAGE"
+
+          docker --host ssh://seraphim-swarm \
+            service update \
+            --with-registry-auth \
+            --image "$DEPLOY_IMAGE" \
+            --update-failure-action rollback \
+            --detach=false \
+            "$SERVICE"
+
+          echo ""
+          echo "VERIFY DEPLOYED IMAGE"
+
+          ACTIVE_IMAGE=$(docker --host ssh://seraphim-swarm \
+            service inspect "$SERVICE" \
+            --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')
+
+          if [[ "$ACTIVE_IMAGE" != "$DEPLOY_IMAGE" ]]; then
+            echo "::error::Deployed image digest mismatch"
+            exit 1
+          fi
+
+          docker --host ssh://seraphim-swarm \
+            service ls --filter name="$SERVICE"
+
+          echo ""
+          echo "========================================"
+          echo " DOCKER SWARM DEPLOYMENT SUCCESS"
+          echo "========================================"
+
+      # STEP 8 - Pipeline Summary
       - name: Pipeline Summary
         if: success()
         shell: bash
+        env:
+          ENABLE_DEPLOY: ${{ vars.ENABLE_SWARM_DEPLOY }}
         run: |
           echo "### Seraphim Secure Pipeline" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -163,4 +274,11 @@ jobs:
           echo "- Harbor Push: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
           echo "- CrowdStrike FCS Scan: PASS" >> "$GITHUB_STEP_SUMMARY"
           echo "- Security Gate: APPROVED" >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$ENABLE_DEPLOY" == "true" ]]; then
+            echo "- Docker Swarm Deployment: EXECUTED" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- Docker Swarm Deployment: DRY RUN" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
           echo "- Commit: ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
