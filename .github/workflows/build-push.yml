@@ -1,5 +1,4 @@
-
-name: Seraphim Secure Pipeline - Build, Scan and Deploy
+name: Seraphim Secure Pipeline - Harbor - FCS - Docker Swarm
 
 on:
   push:
@@ -10,30 +9,41 @@ on:
 permissions:
   contents: read
 
-jobs:
-  docker-build-push:
-    name: Docker Build - Harbor - FCS - Docker Swarm
+# Avoid concurrent deployments of different commits.
+concurrency:
+  group: seraphim-secure-pipeline-main
+  cancel-in-progress: false
 
+jobs:
+  secure-pipeline:
+    name: Build - Harbor - FCS - Swarm
     runs-on:
       - self-hosted
       - Linux
       - X64
       - adm-gitaction
       - pkt
-
-    timeout-minutes: 40
+    timeout-minutes: 50
 
     steps:
       # STEP 1 - Checkout
       - name: Checkout Source Code
         uses: actions/checkout@v4
 
-      # STEP 2 - Verify Docker
-      - name: Verify Docker and Buildx
+      # STEP 2 - Verify prerequisites
+      - name: Verify Runner and Docker
+        shell: bash
         run: |
+          set -euo pipefail
+          echo "========================================"
+          echo " STEP 2 - RUNNER READINESS"
+          echo "========================================"
+          test "$(hostname)" = "adm-gitaction"
           docker --version
           docker buildx version
-          docker info --format 'Storage: {{.Driver}}'
+          docker info --format 'Docker storage: {{.Driver}}'
+          test -S /var/run/docker.sock
+          test -f "$HOME/.ssh/seraphim_swarm_deploy_ed25519"
 
       # STEP 3 - Build and push to Harbor
       - name: Build and Push Image to Harbor
@@ -44,10 +54,9 @@ jobs:
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: |
           set -euo pipefail
-
           umask 077
           export DOCKER_CONFIG="$(mktemp -d)"
-          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
 
           IMAGE="${HARBOR_REGISTRY}/seraphim-secure-pipeline/nginx-lab"
           TAG="sha-${GITHUB_SHA::12}"
@@ -55,26 +64,19 @@ jobs:
           echo "========================================"
           echo " STEP 3 - BUILD AND PUSH TO HARBOR"
           echo "========================================"
-
-          printf '%s' "$HARBOR_PASSWORD" | \
-            docker login "$HARBOR_REGISTRY" \
-              --username "$HARBOR_USERNAME" \
-              --password-stdin
-
+          printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" \
+            --username "$HARBOR_USERNAME" --password-stdin
           docker buildx inspect --bootstrap
-
           docker buildx build \
             --platform linux/amd64 \
             --progress=plain \
             --tag "${IMAGE}:latest" \
             --tag "${IMAGE}:${TAG}" \
-            --push \
-            .
+            --push .
+          echo "BUILD AND PUSH: SUCCESS"
 
-          echo "BUILD AND PUSH SUCCESSFUL"
-
-      # STEP 4 - Pull exact image from Harbor
-      - name: Prepare Image for CrowdStrike FCS
+      # STEP 4 - Pull the exact commit-tagged image
+      - name: Prepare Image for FCS
         id: prepare_image
         shell: bash
         env:
@@ -83,40 +85,71 @@ jobs:
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: |
           set -euo pipefail
-
           umask 077
           export DOCKER_CONFIG="$(mktemp -d)"
-          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
 
-          IMAGE="${HARBOR_REGISTRY}/seraphim-secure-pipeline/nginx-lab:sha-${GITHUB_SHA::12}"
+          REPO="${HARBOR_REGISTRY}/seraphim-secure-pipeline/nginx-lab"
+          IMAGE="${REPO}:sha-${GITHUB_SHA::12}"
 
           echo "========================================"
-          echo " STEP 4 - PREPARE IMAGE FOR FCS"
+          echo " STEP 4 - PREPARE COMMIT IMAGE"
           echo "========================================"
-
-          printf '%s' "$HARBOR_PASSWORD" | \
-            docker login "$HARBOR_REGISTRY" \
-              --username "$HARBOR_USERNAME" \
-              --password-stdin
-
+          printf '%s' "$HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" \
+            --username "$HARBOR_USERNAME" --password-stdin
           docker pull "$IMAGE"
+          docker image inspect "$IMAGE" --format 'Image ID: {{.Id}}'
 
-          docker image inspect "$IMAGE" \
-            --format 'Image ID: {{.Id}}'
+          # Capture the digest attached to the pulled commit-tagged image.
+          DIGEST_REF=""
+          while IFS= read -r REF; do
+            if [[ "$REF" == "${REPO}@sha256:"* ]]; then
+              DIGEST_REF="$REF"
+              break
+            fi
+          done < <(docker image inspect "$IMAGE" \
+            --format '{{range .RepoDigests}}{{println .}}{{end}}')
+          test -n "$DIGEST_REF"
 
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "tagged_image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "digest_image=$DIGEST_REF" >> "$GITHUB_OUTPUT"
+          echo "PULLED IMAGE: $IMAGE"
+          echo "PINNED DIGEST: $DIGEST_REF"
 
-          echo "IMAGE READY FOR FCS"
+      # STEP 5 - Check whether FCS was previously installed
+      - name: Check Permanent FCS CLI
+        id: check_fcs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "========================================"
+          echo " STEP 5 - CHECK PERMANENT FCS CLI"
+          echo "========================================"
+          BIN="$HOME/.local/bin/fcs"
+          if [[ -x "$BIN" ]]; then
+            echo "Existing scanner found: $BIN"
+            test -s "${BIN}.sha256"
+            sha256sum --check --status "${BIN}.sha256"
+            echo "installed=true" >> "$GITHUB_OUTPUT"
+            echo "FCS CLI: VERIFIED (NO DOWNLOAD)"
+          else
+            echo "installed=false" >> "$GITHUB_OUTPUT"
+            echo "FCS CLI: NOT INSTALLED - ONE-TIME BOOTSTRAP"
+          fi
 
-      # STEP 5 - CrowdStrike FCS Image Scan
-      - name: CrowdStrike FCS Image Scan
-        id: fcs
+      # STEP 5A - Bootstrap once using the official FCS Action.
+      # This step is skipped on subsequent runs with the permanent binary.
+      - name: Bootstrap FCS CLI and Scan (First Run Only)
+        id: fcs_bootstrap
+        if: ${{ steps.check_fcs.outputs.installed == 'false' }}
+        continue-on-error: true
         uses: crowdstrike/fcs-action@v5.0.4
         with:
           falcon_client_id: ${{ vars.FALCON_CLIENT_ID }}
           falcon_region: us-1
+          version: '4.2.3'
           scan_type: image
-          image: docker://${{ steps.prepare_image.outputs.image }}
+          image: docker://${{ steps.prepare_image.outputs.digest_image }}
           socket: unix:///var/run/docker.sock
           platform: linux/amd64
           upload_results: true
@@ -126,159 +159,186 @@ jobs:
         env:
           FALCON_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
 
-      # STEP 6 - CrowdStrike Security Gate
-      - name: Enforce CrowdStrike Security Gate
-        id: security_gate
-        if: ${{ always() && steps.prepare_image.outcome == 'success' }}
+      # STEP 5B - Preserve the validated binary outside runner temp.
+      # Runs even when assessment policy rejects the image, provided the
+      # official action successfully downloaded the scanner.
+      - name: Save FCS CLI Permanently (First Run Only)
+        id: save_fcs
+        if: ${{ always() && steps.check_fcs.outputs.installed == 'false' }}
         shell: bash
-        env:
-          FCS_OUTCOME: ${{ steps.fcs.outcome }}
-          FCS_EXIT_CODE: ${{ steps.fcs.outputs.exit-code }}
         run: |
           set -euo pipefail
+          echo "========================================"
+          echo " STEP 5B - SAVE FCS CLI PERMANENTLY"
+          echo "========================================"
+          SOURCE="${RUNNER_TEMP}/fcs"
+          DEST="${HOME}/.local/bin/fcs"
+          test -x "$SOURCE"
+          umask 077
+          mkdir -p "${HOME}/.local/bin"
+          install -m 0750 "$SOURCE" "$DEST"
+          sha256sum "$DEST" > "${DEST}.sha256"
+          chmod 600 "${DEST}.sha256"
+          sha256sum --check --status "${DEST}.sha256"
+          echo "FCS PERMANENT INSTALL: SUCCESS"
+          ls -lh "$DEST"
 
+      # STEP 5C - Reuse preinstalled CLI on all subsequent runs.
+      - name: Scan Image Using Installed FCS CLI
+        id: fcs_local
+        if: ${{ steps.check_fcs.outputs.installed == 'true' }}
+        shell: bash
+        env:
+          FCS_CLIENT_ID: ${{ vars.FALCON_CLIENT_ID }}
+          FCS_CLIENT_SECRET: ${{ secrets.FALCON_CLIENT_SECRET }}
+          IMAGE_TO_SCAN: ${{ steps.prepare_image.outputs.digest_image }}
+        run: |
+          set -euo pipefail
+          echo "========================================"
+          echo " STEP 5C - SCAN USING INSTALLED FCS CLI"
+          echo "========================================"
+          BIN="$HOME/.local/bin/fcs"
+          test -x "$BIN"
+          sha256sum --check --status "${BIN}.sha256"
+          test -n "$FCS_CLIENT_ID"
+          test -n "$FCS_CLIENT_SECRET"
+
+          # Credentials are masked by GitHub Actions. Do not enable shell tracing.
+          set +e
+          "$BIN" scan image "docker://${IMAGE_TO_SCAN}" \
+            --falcon-region us-1 \
+            --socket unix:///var/run/docker.sock \
+            --platform linux/amd64 \
+            --output ./image-scan-results.json \
+            --format json \
+            --timeout 600 \
+            --upload \
+            --client-id "$FCS_CLIENT_ID" \
+            --client-secret "$FCS_CLIENT_SECRET" \
+            2>&1 | tee fcs-scan.log
+          SCAN_RC=${PIPESTATUS[0]}
+          set -e
+
+          echo "exit-code=$SCAN_RC" >> "$GITHUB_OUTPUT"
+          echo "FCS CLI EXIT CODE: $SCAN_RC"
+          exit "$SCAN_RC"
+
+      # STEP 6 - Fail closed if the effective scanner did not pass.
+      - name: Enforce CrowdStrike Security Gate
+        id: security_gate
+        if: ${{ always() }}
+        shell: bash
+        env:
+          PREP_OUTCOME: ${{ steps.prepare_image.outcome }}
+          EXISTED: ${{ steps.check_fcs.outputs.installed }}
+          BOOT_OUTCOME: ${{ steps.fcs_bootstrap.outcome }}
+          BOOT_EXIT: ${{ steps.fcs_bootstrap.outputs.exit-code }}
+          SAVE_OUTCOME: ${{ steps.save_fcs.outcome }}
+          LOCAL_OUTCOME: ${{ steps.fcs_local.outcome }}
+          LOCAL_EXIT: ${{ steps.fcs_local.outputs.exit-code }}
+        run: |
+          set -euo pipefail
           echo "========================================"
           echo " STEP 6 - CROWDSTRIKE SECURITY GATE"
           echo "========================================"
 
-          echo "FCS Action: $FCS_OUTCOME"
-          echo "FCS Exit Code: ${FCS_EXIT_CODE:-missing}"
+          [[ "$PREP_OUTCOME" == "success" ]] || {
+            echo "::error::Image preparation did not succeed"; exit 1;
+          }
 
-          if [[ "$FCS_OUTCOME" != "success" || "$FCS_EXIT_CODE" != "0" ]]; then
-            echo "::error::SECURITY GATE FAILED"
-            echo "DEPLOYMENT BLOCKED"
+          if [[ "$EXISTED" == "true" ]]; then
+            echo "Mode: PREINSTALLED CLI"
+            echo "Scan outcome: $LOCAL_OUTCOME | Exit: ${LOCAL_EXIT:-missing}"
+            [[ "$LOCAL_OUTCOME" == "success" && "$LOCAL_EXIT" == "0" ]] || {
+              echo "::error::SECURITY GATE FAILED - local FCS scan"; exit 1;
+            }
+          elif [[ "$EXISTED" == "false" ]]; then
+            echo "Mode: ONE-TIME BOOTSTRAP"
+            echo "Scan outcome: $BOOT_OUTCOME | Exit: ${BOOT_EXIT:-missing}"
+            [[ "$SAVE_OUTCOME" == "success" ]] || {
+              echo "::error::FCS CLI permanent installation failed"; exit 1;
+            }
+            [[ "$BOOT_OUTCOME" == "success" && "$BOOT_EXIT" == "0" ]] || {
+              echo "::error::SECURITY GATE FAILED - bootstrap FCS scan"; exit 1;
+            }
+          else
+            echo "::error::FCS CLI check failed or returned no result"
             exit 1
           fi
 
+          echo "decision=pass" >> "$GITHUB_OUTPUT"
           echo "SECURITY GATE: PASS"
-          echo "IMAGE APPROVED FOR NEXT PIPELINE STAGE"
 
-      # STEP 7 - Docker Swarm Deployment
+      # STEP 7 - Dry run by default; enable only after policy FAIL testing.
       - name: Deploy Approved Image to Docker Swarm
         id: swarm_deploy
-        if: ${{ success() && github.ref == 'refs/heads/main' && steps.security_gate.outcome == 'success' && steps.fcs.outputs.exit-code == '0' }}
+        if: ${{ success() && github.ref == 'refs/heads/main' && steps.security_gate.outputs.decision == 'pass' }}
         shell: bash
         env:
           ENABLE_DEPLOY: ${{ vars.ENABLE_SWARM_DEPLOY }}
           HARBOR_REGISTRY: ${{ secrets.HARBOR_REGISTRY }}
-          TAGGED_IMAGE: ${{ steps.prepare_image.outputs.image }}
+          DEPLOY_IMAGE: ${{ steps.prepare_image.outputs.digest_image }}
           SWARM_HARBOR_USERNAME: ${{ secrets.SWARM_HARBOR_USERNAME }}
           SWARM_HARBOR_PASSWORD: ${{ secrets.SWARM_HARBOR_PASSWORD }}
         run: |
           set -euo pipefail
-
+          SERVICE="seraphim-nginx-lab"
           echo "========================================"
           echo " STEP 7 - DOCKER SWARM DEPLOYMENT"
           echo "========================================"
-
-          SERVICE="seraphim-nginx-lab"
-          REPO="${HARBOR_REGISTRY}/seraphim-secure-pipeline/nginx-lab"
-
-          echo ""
-          echo "[1/5] VERIFY APPROVED IMAGE DIGEST"
-
-          DEPLOY_IMAGE=""
-
-          while IFS= read -r REF; do
-            if [[ "$REF" == "${REPO}@sha256:"* ]]; then
-              DEPLOY_IMAGE="$REF"
-              break
-            fi
-          done < <(
-            docker image inspect "$TAGGED_IMAGE" \
-              --format '{{range .RepoDigests}}{{println .}}{{end}}'
-          )
-
-          if [[ -z "$DEPLOY_IMAGE" ]]; then
-            echo "::error::Registry image digest not found"
-            exit 1
-          fi
-
-          echo "Approved image: $DEPLOY_IMAGE"
-
-          echo ""
-          echo "[2/5] VERIFY REMOTE SWARM MANAGER"
-
-          test "$(docker --host ssh://seraphim-swarm \
-            info --format '{{.Swarm.ControlAvailable}}')" = "true"
-
-          docker --host ssh://seraphim-swarm \
-            service inspect "$SERVICE" >/dev/null
-
-          echo "SWARM CONNECTION: SUCCESS"
-
-          echo ""
-          echo "[3/5] CHECK DEPLOYMENT MODE"
+          test -n "$DEPLOY_IMAGE"
+          test "$(docker --host ssh://seraphim-swarm info \
+            --format '{{.Swarm.ControlAvailable}}')" = "true"
+          docker --host ssh://seraphim-swarm service inspect "$SERVICE" >/dev/null
+          echo "SWARM SSH AND MANAGER: READY"
+          echo "APPROVED DIGEST: $DEPLOY_IMAGE"
 
           if [[ "$ENABLE_DEPLOY" != "true" ]]; then
             echo "DEPLOYMENT MODE: DRY RUN"
-            echo "SECURITY GATE: PASS"
-            echo "Approved image: $DEPLOY_IMAGE"
             echo "NO SWARM SERVICE CHANGES"
             exit 0
           fi
 
-          echo ""
-          echo "[4/5] AUTHENTICATE TO HARBOR"
-
           umask 077
           export DOCKER_CONFIG="$(mktemp -d)"
-          trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+          trap 'rm -rf -- "$DOCKER_CONFIG"' EXIT
+          printf '%s' "$SWARM_HARBOR_PASSWORD" | docker login "$HARBOR_REGISTRY" \
+            --username "$SWARM_HARBOR_USERNAME" --password-stdin
 
-          printf '%s' "$SWARM_HARBOR_PASSWORD" | \
-            docker login "$HARBOR_REGISTRY" \
-              --username "$SWARM_HARBOR_USERNAME" \
-              --password-stdin
-
-          echo ""
-          echo "[5/5] DEPLOY APPROVED IMAGE"
-
-          docker --host ssh://seraphim-swarm \
-            service update \
+          docker --host ssh://seraphim-swarm service update \
             --with-registry-auth \
             --image "$DEPLOY_IMAGE" \
             --update-failure-action rollback \
             --detach=false \
             "$SERVICE"
 
-          echo ""
-          echo "VERIFY DEPLOYED IMAGE"
+          ACTIVE_IMAGE="$(docker --host ssh://seraphim-swarm service inspect \
+            "$SERVICE" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')"
+          [[ "$ACTIVE_IMAGE" == "$DEPLOY_IMAGE" ]] || {
+            echo "::error::Deployed digest mismatch"; exit 1;
+          }
 
-          ACTIVE_IMAGE=$(docker --host ssh://seraphim-swarm \
-            service inspect "$SERVICE" \
-            --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')
+          HTTP="$(ssh seraphim-swarm \
+            "curl --max-time 10 -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:8088/")"
+          [[ "$HTTP" == "200" ]] || {
+            echo "::error::Nginx health check failed: $HTTP"; exit 1;
+          }
+          echo "DOCKER SWARM DEPLOYMENT: SUCCESS"
 
-          if [[ "$ACTIVE_IMAGE" != "$DEPLOY_IMAGE" ]]; then
-            echo "::error::Deployed image digest mismatch"
-            exit 1
-          fi
-
-          docker --host ssh://seraphim-swarm \
-            service ls --filter name="$SERVICE"
-
-          echo ""
-          echo "========================================"
-          echo " DOCKER SWARM DEPLOYMENT SUCCESS"
-          echo "========================================"
-
-      # STEP 8 - Pipeline Summary
+      # STEP 8 - Summary
       - name: Pipeline Summary
-        if: success()
+        if: ${{ always() }}
         shell: bash
         env:
+          GATE_OUTCOME: ${{ steps.security_gate.outcome }}
+          DEPLOY_OUTCOME: ${{ steps.swarm_deploy.outcome }}
           ENABLE_DEPLOY: ${{ vars.ENABLE_SWARM_DEPLOY }}
         run: |
-          echo "### Seraphim Secure Pipeline" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Docker Build: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Harbor Push: SUCCESS" >> "$GITHUB_STEP_SUMMARY"
-          echo "- CrowdStrike FCS Scan: PASS" >> "$GITHUB_STEP_SUMMARY"
-          echo "- Security Gate: APPROVED" >> "$GITHUB_STEP_SUMMARY"
-
+          echo '### Seraphim Secure Pipeline' >> "$GITHUB_STEP_SUMMARY"
+          echo "- Build commit: ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Security Gate: ${GATE_OUTCOME}" >> "$GITHUB_STEP_SUMMARY"
           if [[ "$ENABLE_DEPLOY" == "true" ]]; then
-            echo "- Docker Swarm Deployment: EXECUTED" >> "$GITHUB_STEP_SUMMARY"
+            echo "- Swarm Deployment: ${DEPLOY_OUTCOME}" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "- Docker Swarm Deployment: DRY RUN" >> "$GITHUB_STEP_SUMMARY"
+            echo '- Swarm Deployment: DRY RUN (unless security gate failed)' >> "$GITHUB_STEP_SUMMARY"
           fi
-
-          echo "- Commit: ${GITHUB_SHA}" >> "$GITHUB_STEP_SUMMARY"
